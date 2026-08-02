@@ -2,6 +2,8 @@ package org.lwjgl.opengl.awt;
 
 import org.lwjgl.opengl.GL;
 
+import java.util.function.IntUnaryOperator;
+
 import static org.lwjgl.opengl.GL11.GL_BACK;
 import static org.lwjgl.opengl.GL11.GL_COLOR_BUFFER_BIT;
 import static org.lwjgl.opengl.GL11.GL_DOUBLEBUFFER;
@@ -91,7 +93,7 @@ final class ManagedMultisampleFramebuffer {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         // Some platforms cannot honor the requested buffering mode, so query the actual default framebuffer.
-        glDrawBuffer(glGetInteger(GL_DOUBLEBUFFER) != 0 ? GL_BACK : GL_FRONT);
+        glDrawBuffer(defaultDrawBuffer(org.lwjgl.opengl.GL11::glGetInteger));
         glBlitFramebuffer(0, 0, resolveWidth, resolveHeight, 0, 0, resolveWidth, resolveHeight,
                 GL_COLOR_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
@@ -167,5 +169,9 @@ final class ManagedMultisampleFramebuffer {
     static int growCapacity(int current, int required) {
         long grown = current == 0 ? required : (long) current + Math.max(1, current / 2);
         return (int) Math.min(Integer.MAX_VALUE, Math.max(required, grown));
+    }
+
+    static int defaultDrawBuffer(IntUnaryOperator getInteger) {
+        return getInteger.applyAsInt(GL_DOUBLEBUFFER) != 0 ? GL_BACK : GL_FRONT;
     }
 }

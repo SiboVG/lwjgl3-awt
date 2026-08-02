@@ -6,16 +6,23 @@ import org.lwjgl.opengl.GL;
 import javax.swing.JFrame;
 import javax.swing.SwingUtilities;
 import java.awt.Dimension;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.lwjgl.opengl.ARBMultisample.GL_SAMPLES_ARB;
+import static org.lwjgl.opengl.GL11.GL_BACK;
 import static org.lwjgl.opengl.GL11.GL_COLOR_BUFFER_BIT;
+import static org.lwjgl.opengl.GL11.GL_DOUBLEBUFFER;
+import static org.lwjgl.opengl.GL11.GL_FRONT;
 import static org.lwjgl.opengl.GL11.GL_NO_ERROR;
 import static org.lwjgl.opengl.GL11.glClear;
 import static org.lwjgl.opengl.GL11.glGetError;
 import static org.lwjgl.opengl.GL11.glGetInteger;
+import static org.lwjgl.opengl.GL30.GL_MAX_SAMPLES;
 
 class ManagedMultisampleFramebufferTest {
 
@@ -41,9 +48,23 @@ class ManagedMultisampleFramebufferTest {
     }
 
     @Test
+    void defaultDrawBufferUsesTheActualContextBufferingMode() {
+        assertEquals(GL_FRONT, ManagedMultisampleFramebuffer.defaultDrawBuffer(parameter -> {
+            assertEquals(GL_DOUBLEBUFFER, parameter);
+            return 0;
+        }));
+        assertEquals(GL_BACK, ManagedMultisampleFramebuffer.defaultDrawBuffer(parameter -> {
+            assertEquals(GL_DOUBLEBUFFER, parameter);
+            return 1;
+        }));
+    }
+
+    @Test
     void managedResolveUsesAValidDefaultFramebufferBuffer() throws Exception {
         AtomicReference<JFrame> frameRef = new AtomicReference<>();
         AtomicReference<AWTGLCanvas> canvasRef = new AtomicReference<>();
+        AtomicBoolean supportsManagedMultisampling = new AtomicBoolean();
+        AtomicInteger maximumSamples = new AtomicInteger();
 
         SwingUtilities.invokeAndWait(() -> {
             GLData data = new GLData();
@@ -84,6 +105,18 @@ class ManagedMultisampleFramebufferTest {
         });
 
         try {
+            SwingUtilities.invokeAndWait(() -> canvasRef.get().runInContext(() -> {
+                GL.createCapabilities();
+                supportsManagedMultisampling.set(GL.getCapabilities().OpenGL30);
+                if (supportsManagedMultisampling.get()) {
+                    maximumSamples.set(glGetInteger(GL_MAX_SAMPLES));
+                }
+            }));
+            assumeTrue(supportsManagedMultisampling.get(),
+                    "Managed multisampling requires OpenGL 3.0 or newer");
+            assumeTrue(maximumSamples.get() >= 4,
+                    "Managed 4x multisampling requires GL_MAX_SAMPLES of at least 4");
+
             // Render in a separate event so AWT has delivered the initial resize event and the canvas has non-zero
             // framebuffer dimensions.
             SwingUtilities.invokeAndWait(canvasRef.get()::render);
