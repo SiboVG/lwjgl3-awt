@@ -31,7 +31,7 @@ Full code samples:
 
 ### OpenGL
 
-In order to create an OpenGL 3.3 core profile context with 4 sample MSAA, use:
+In order to create an OpenGL 3.3 core profile context with resize-safe 4 sample MSAA, use:
 
 ```Java
 JFrame frame = new JFrame("AWT test");
@@ -41,7 +41,7 @@ GLData data = new GLData();
 data.majorVersion = 3;
 data.minorVersion = 3;
 data.profile = GLData.Profile.CORE;
-data.samples = 4;
+data.managedSamples = 4;
 frame.add(new AWTGLCanvas(data) {
   public void initGL() {
   }
@@ -49,6 +49,8 @@ frame.add(new AWTGLCanvas(data) {
   }
 });
 ```
+
+Managed MSAA renders `paintGL()` into a grow-only framebuffer object and resolves it when `swapBuffers()` is called. This avoids repeatedly reallocating a multisampled native window surface during resizing. If rendering code explicitly binds framebuffer zero, bind `getDefaultFramebuffer()` instead. Native-window MSAA remains available with `data.samples = 4`, but can retain substantial resize surfaces on some Windows graphics drivers.
 
 ### Vulkan
 

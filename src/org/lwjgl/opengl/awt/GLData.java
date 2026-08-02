@@ -65,8 +65,23 @@ public class GLData {
     public int sampleBuffers;
     /**
      * The number of (coverage) samples for multisampling. Multisampling will only be requested for a value greater than or equal to 1.
+     *
+     * <p>Some Windows graphics drivers retain resized backing surfaces for a multisampled window framebuffer until the OpenGL context is
+     * destroyed. Applications affected by high memory usage during continuous resizing should leave this at zero and use
+     * {@link #managedSamples} or an application-managed framebuffer object instead.</p>
      */
     public int samples;
+    /**
+     * The number of samples for an {@link AWTGLCanvas}-managed framebuffer object. It defaults to zero (disabled).
+     *
+     * <p>When enabled, {@link AWTGLCanvas#paintGL()} starts with a multisampled framebuffer bound and
+     * {@link AWTGLCanvas#swapBuffers()} resolves it into the single-sampled window framebuffer. Its storage grows geometrically and is
+     * reused while the canvas shrinks, avoiding repeated multisampled WGL window-surface allocations during resizing. This requires
+     * OpenGL 3.0 or newer and cannot be combined with native-window {@link #samples}.</p>
+     *
+     * <p>Code that explicitly binds framebuffer zero should bind {@link AWTGLCanvas#getDefaultFramebuffer()} instead.</p>
+     */
+    public int managedSamples;
     /**
      * The {@link AWTGLCanvas} whose context objects should be shared with the context created using <code>this</code> GLData.
      */

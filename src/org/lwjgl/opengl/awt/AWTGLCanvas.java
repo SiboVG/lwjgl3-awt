@@ -35,6 +35,7 @@ public abstract class AWTGLCanvas extends Canvas {
     protected long context;
     protected final GLData data;
     protected final GLData effective = new GLData();
+    private final ManagedMultisampleFramebuffer managedMultisampleFramebuffer;
     protected boolean initCalled;
     private int framebufferWidth, framebufferHeight;
     private final ComponentListener listener = new ComponentAdapter() {
@@ -73,11 +74,36 @@ public abstract class AWTGLCanvas extends Canvas {
             // prepare for a possible re-adding
             context = 0L;
             initCalled = false;
+            if (managedMultisampleFramebuffer != null) {
+                managedMultisampleFramebuffer.contextDeleted();
+            }
             platformCanvas.dispose();
         }
     }
     protected AWTGLCanvas(GLData data) {
+        if (data.samples < 0 || data.managedSamples < 0) {
+            throw new IllegalArgumentException("Sample counts must not be negative");
+        }
+        if (data.samples > 0 && data.managedSamples > 0) {
+            throw new IllegalArgumentException("Native-window samples and managed samples cannot both be enabled");
+        }
+        if (data.managedSamples > 0 && data.api != GLData.API.GL) {
+            throw new IllegalArgumentException("Managed multisampling currently supports desktop OpenGL only");
+        }
+        if (data.managedSamples > 0 && data.stereo) {
+            throw new IllegalArgumentException("Managed multisampling does not support stereo window buffers");
+        }
+        if (data.managedSamples > 0 && (data.accumRedSize > 0 || data.accumGreenSize > 0
+                || data.accumBlueSize > 0 || data.accumAlphaSize > 0)) {
+            throw new IllegalArgumentException("Managed multisampling does not support accumulation buffers");
+        }
+        if (data.managedSamples > 0 && data.colorSamplesNV > 0) {
+            throw new IllegalArgumentException("Managed multisampling does not support NV coverage samples");
+        }
         this.data = data;
+        this.managedMultisampleFramebuffer = data.managedSamples > 0
+                ? new ManagedMultisampleFramebuffer(data)
+                : null;
         this.addComponentListener(listener);
     }
 
@@ -89,6 +115,7 @@ public abstract class AWTGLCanvas extends Canvas {
         if (context == 0L) {
             try {
                 context = platformCanvas.create(this, data, effective);
+                effective.managedSamples = data.managedSamples;
             } catch (AWTException e) {
                 throw new RuntimeException("Exception while creating the OpenGL context", e);
             }
@@ -135,6 +162,9 @@ public abstract class AWTGLCanvas extends Canvas {
                 initGL();
                 initCalled = true;
             }
+            if (managedMultisampleFramebuffer != null) {
+                managedMultisampleFramebuffer.bind(framebufferWidth, framebufferHeight);
+            }
             paintGL();
         } finally {
             afterRender();
@@ -159,7 +189,22 @@ public abstract class AWTGLCanvas extends Canvas {
         return framebufferHeight;
     }
 
+    /**
+     * Returns the framebuffer that application rendering should treat as the default framebuffer.
+     *
+     * <p>The managed framebuffer is allocated after {@link #initGL()} and before the first {@link #paintGL()} call. This method therefore
+     * returns zero from {@code initGL()} and the managed framebuffer name while {@code paintGL()} is running.</p>
+     *
+     * @return the managed multisample framebuffer while it is allocated; otherwise zero
+     */
+    public int getDefaultFramebuffer() {
+        return managedMultisampleFramebuffer != null ? managedMultisampleFramebuffer.framebuffer() : 0;
+    }
+
     public final void swapBuffers() {
+        if (managedMultisampleFramebuffer != null) {
+            managedMultisampleFramebuffer.resolve(framebufferWidth, framebufferHeight);
+        }
         platformCanvas.swapBuffers();
     }
     

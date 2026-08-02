@@ -21,7 +21,10 @@ public class Core32Test {
         frame.setLayout(new BorderLayout());
         frame.setPreferredSize(new Dimension(600, 600));
         GLData data = new GLData();
-        data.samples = 4;
+        // Keep the WGL window single-sampled and resolve a managed 4x MSAA framebuffer into it. This retains
+        // antialiasing without asking affected Windows drivers to resize a multisampled window surface repeatedly.
+        data.samples = Integer.getInteger("lwjgl3awt.test.windowSamples", 0);
+        data.managedSamples = data.samples > 0 ? 0 : Integer.getInteger("lwjgl3awt.test.samples", 4);
         data.swapInterval = 0;
         data.majorVersion = 3;
         data.minorVersion = 2;
@@ -34,6 +37,8 @@ public class Core32Test {
             public void initGL() {
                 System.out.println("OpenGL version: " + effective.majorVersion + "." + effective.minorVersion + " (Profile: " + effective.profile + ")");
                 createCapabilities();
+                System.out.println("OpenGL vendor: " + glGetString(GL_VENDOR));
+                System.out.println("OpenGL renderer: " + glGetString(GL_RENDERER));
                 glClearColor(0.3f, 0.4f, 0.5f, 1);
                 glBindVertexArray(glGenVertexArrays());
                 int vbo = glGenBuffers();

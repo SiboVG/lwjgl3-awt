@@ -53,8 +53,22 @@ class AWTGLCanvasLifecycleTest {
         assertEquals(Arrays.asList("dispose"), platform.calls);
     }
 
+    @Test
+    void rejectsNativeAndManagedMultisamplingTogether() {
+        GLData data = new GLData();
+        data.samples = 4;
+        data.managedSamples = 4;
+
+        assertThrows(IllegalArgumentException.class, () -> new TestCanvas(data, new RecordingPlatformCanvas()));
+    }
+
     private static class TestCanvas extends AWTGLCanvas {
         TestCanvas(PlatformGLCanvas platformCanvas) {
+            this.platformCanvas = platformCanvas;
+        }
+
+        TestCanvas(GLData data, PlatformGLCanvas platformCanvas) {
+            super(data);
             this.platformCanvas = platformCanvas;
         }
 
