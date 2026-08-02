@@ -4,6 +4,7 @@ import org.lwjgl.opengl.GL;
 
 import static org.lwjgl.opengl.GL11.GL_BACK;
 import static org.lwjgl.opengl.GL11.GL_COLOR_BUFFER_BIT;
+import static org.lwjgl.opengl.GL11.GL_DOUBLEBUFFER;
 import static org.lwjgl.opengl.GL11.GL_FRONT;
 import static org.lwjgl.opengl.GL11.GL_NEAREST;
 import static org.lwjgl.opengl.GL11.GL_RGBA8;
@@ -43,7 +44,6 @@ import static org.lwjgl.opengl.GL30.glRenderbufferStorageMultisample;
  */
 final class ManagedMultisampleFramebuffer {
     private final int samples;
-    private final boolean doubleBuffered;
     private final int colorFormat;
     private final int depthStencilFormat;
     private final int depthStencilAttachment;
@@ -55,7 +55,6 @@ final class ManagedMultisampleFramebuffer {
 
     ManagedMultisampleFramebuffer(GLData data) {
         this.samples = data.managedSamples;
-        this.doubleBuffered = data.doubleBuffer;
         this.colorFormat = data.pixelFormatFloat ? GL_RGBA16F : data.sRGB ? GL_SRGB8_ALPHA8 : GL_RGBA8;
         if (data.depthSize > 0 && data.stencilSize > 0) {
             this.depthStencilFormat = GL_DEPTH24_STENCIL8;
@@ -91,7 +90,8 @@ final class ManagedMultisampleFramebuffer {
         }
         glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glDrawBuffer(doubleBuffered ? GL_BACK : GL_FRONT);
+        // Some platforms cannot honor the requested buffering mode, so query the actual default framebuffer.
+        glDrawBuffer(glGetInteger(GL_DOUBLEBUFFER) != 0 ? GL_BACK : GL_FRONT);
         glBlitFramebuffer(0, 0, resolveWidth, resolveHeight, 0, 0, resolveWidth, resolveHeight,
                 GL_COLOR_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
