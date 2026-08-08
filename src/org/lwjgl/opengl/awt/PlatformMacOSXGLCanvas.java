@@ -26,6 +26,8 @@ import java.awt.event.HierarchyEvent;
 import java.nio.ByteBuffer;
 import java.nio.DoubleBuffer;
 import java.nio.IntBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.lwjgl.opengl.CGL.*;
 import static org.lwjgl.opengl.GL11.glFlush;
@@ -38,6 +40,8 @@ import static org.lwjgl.system.macosx.ObjCRuntime.objc_getClass;
 import static org.lwjgl.system.macosx.ObjCRuntime.sel_getUid;
 
 public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
+    private static final long PRESENTATION_BARRIER_TIMEOUT_NANOS = 5_000_000_000L;
+    private static final long PRESENTATION_BARRIER_POLL_NANOS = 1_000_000L;
     public static final JAWT awt;
     private static final long objc_msgSend;
     private static final long objc_autoreleasePoolPush;
@@ -70,6 +74,7 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
     private int layerHeight;
     private long context;
     private boolean doubleBuffered;
+    private final List<Long> presentationBarriers = new ArrayList<>();
 
     @Override
     public long create(Canvas canvas, GLData attribs, GLData effective) throws AWTException {
@@ -81,7 +86,11 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
                     // if the canvas, or a parent component is hidden/shown, we must update the hidden state of the layer
                     if (view != 0L && (e.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) > 0) {
                         long layer = invokePPP(view, sel_getUid("layer"), objc_msgSend);
-                        setLayerHiddenOnMainThread(layer, !e.getChanged().isShowing());
+                        boolean showing = canvas.isShowing();
+                        setLayerHiddenOnMainThread(layer, !showing);
+                        if (showing) {
+                            queuePresentationBarrier();
+                        }
                     }
                 });
                 hierarchyListenerAdded = true;
@@ -153,6 +162,7 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
 
             attachSurfaceLayer(surfaceLayer, interLayer);
             performSelectorOnMainThread(interLayer, sel_getUid("release"), MemoryUtil.NULL);
+            queuePresentationBarrier();
             return context;
         } catch (AWTException | RuntimeException | Error failure) {
             try {
@@ -459,6 +469,195 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
                 objc_msgSend);
     }
 
+    /**
+     * Adds a FIFO marker to AppKit's main-thread queue. Each marker owns an NSConditionLock until both AppKit and the
+     * render thread have observed it, allowing rendering to wait for earlier layer attachment/visibility mutations
+     * without holding the JAWT drawing-surface lock. The preceding Core Animation flush is limited to these surface
+     * transitions; it commits their implicit transaction before the marker makes the render thread runnable.
+     */
+    private void queuePresentationBarrier() {
+        long autoreleasePool = invokeP(objc_autoreleasePoolPush);
+        try {
+            performSelectorOnMainThread(
+                    objc_getClass("CATransaction"), sel_getUid("flush"), MemoryUtil.NULL);
+
+            long barrier = invokePPP(objc_getClass("NSConditionLock"), sel_getUid("alloc"), objc_msgSend);
+            barrier = invokePPP(barrier, sel_getUid("initWithCondition:"), 0, objc_msgSend);
+            if (barrier == 0L) {
+                throw new IllegalStateException("Unable to create an AppKit presentation barrier");
+            }
+
+            // Keep one retain for the Java-side list and one until AppKit has processed the queued selectors. This
+            // also makes teardown safe when it releases the Java retain before AppKit reaches the marker.
+            invokePPP(barrier, sel_getUid("retain"), objc_msgSend);
+            synchronized (presentationBarriers) {
+                presentationBarriers.add(barrier);
+            }
+            performSelectorOnMainThread(barrier, sel_getUid("lock"), MemoryUtil.NULL);
+            queueUnlockWithCondition(barrier);
+            performSelectorOnMainThread(barrier, sel_getUid("release"), MemoryUtil.NULL);
+        } finally {
+            invokePV(autoreleasePool, objc_autoreleasePoolPop);
+        }
+    }
+
+    private static void queueUnlockWithCondition(long barrier) {
+        long unlockWithCondition = sel_getUid("unlockWithCondition:");
+        long methodSignature = invokePPPP(
+                barrier, sel_getUid("methodSignatureForSelector:"), unlockWithCondition, objc_msgSend);
+        long invocation = invokePPPP(objc_getClass("NSInvocation"),
+                sel_getUid("invocationWithMethodSignature:"), methodSignature, objc_msgSend);
+        invokePPPV(invocation, sel_getUid("setTarget:"), barrier, objc_msgSend);
+        invokePPPV(invocation, sel_getUid("setSelector:"), unlockWithCondition, objc_msgSend);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // The ready condition is the NSInteger 1; a pointer-sized element has NSInteger's width on 64-bit macOS.
+            PointerBuffer readyCondition = stack.pointers(1L);
+            JNI.callPPPPV(invocation,
+                    sel_getUid("setArgument:atIndex:"), memAddress(readyCondition), 2, objc_msgSend);
+        }
+        invokePPP(invocation, sel_getUid("retain"), objc_msgSend);
+        performSelectorOnMainThread(invocation, sel_getUid("invoke"), MemoryUtil.NULL);
+        performSelectorOnMainThread(invocation, sel_getUid("release"), MemoryUtil.NULL);
+    }
+
+    @Override
+    public void prepareForRender() throws AWTException {
+        Canvas canvas = this.canvas;
+        if (canvas != null) {
+            if (updateLayerBounds(currentLayerBounds(canvas))) {
+                // updateLayerBounds queues all of its AppKit mutations from this thread, so this marker is ordered
+                // after them. Waiting here keeps those mutations from reallocating the drawable after the swap.
+                queuePresentationBarrier();
+            }
+        }
+
+        if (EventQueue.isDispatchThread() || isAppKitMainThread()) {
+            // AppKit and AWT synchronously call into each other (see attachSurfaceLayer), so neither thread may wait
+            // for the other's queue here. Consume what is already ready; a later render-thread call enforces the rest.
+            drainReadyPresentationBarriers();
+            return;
+        }
+
+        long deadline = System.nanoTime() + PRESENTATION_BARRIER_TIMEOUT_NANOS;
+        while (true) {
+            long barrier = firstPresentationBarrier();
+            if (barrier == 0L) {
+                return;
+            }
+            while (!tryLockReadyBarrier(barrier)) {
+                if (System.nanoTime() >= deadline) {
+                    throw new AWTException("Timed out waiting for AppKit to make the OpenGL surface presentable");
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new AWTException("Interrupted while waiting for the OpenGL surface to become presentable");
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(PRESENTATION_BARRIER_POLL_NANOS);
+            }
+            invokePPV(barrier, sel_getUid("unlock"), objc_msgSend);
+            releasePresentationBarrier(barrier);
+        }
+    }
+
+    /**
+     * Computes the layer bounds for the component's current state. Swing hierarchies are measured lock-free by
+     * {@link #getLayerBounds}; without a JRootPane ancestor that walk yields no coordinates, so the JAWT drawing
+     * surface is locked briefly to read them instead. That lock is released before any barrier wait, and the extra
+     * per-render lock cycle is confined to non-Swing hierarchies.
+     */
+    private int[] currentLayerBounds(Canvas canvas) throws AWTException {
+        if (hasSwingRootAncestor(canvas)) {
+            // getLayerBounds recomputes x and y from the hierarchy; the passed coordinates are unused fallbacks.
+            return getLayerBounds(canvas, layerX, layerY, canvas.getWidth(), canvas.getHeight());
+        }
+        JAWTDrawingSurface ds = JAWT_GetDrawingSurface(canvas, awt.GetDrawingSurface());
+        if (ds == null) {
+            throw new AWTException("Failed to get JAWT drawing surface");
+        }
+        try {
+            int lock = JAWT_DrawingSurface_Lock(ds, ds.Lock());
+            if ((lock & JAWT_LOCK_ERROR) != 0) {
+                throw new AWTException("JAWT_DrawingSurface_Lock() failed");
+            }
+            try {
+                JAWTDrawingSurfaceInfo dsi =
+                        JAWT_DrawingSurface_GetDrawingSurfaceInfo(ds, ds.GetDrawingSurfaceInfo());
+                if (dsi == null) {
+                    throw new AWTException("Failed to get JAWT drawing surface information");
+                }
+                try {
+                    return getLayerBounds(canvas, dsi.bounds().x(), dsi.bounds().y(),
+                            dsi.bounds().width(), dsi.bounds().height());
+                } finally {
+                    JAWT_DrawingSurface_FreeDrawingSurfaceInfo(dsi, ds.FreeDrawingSurfaceInfo());
+                }
+            } finally {
+                JAWT_DrawingSurface_Unlock(ds, ds.Unlock());
+            }
+        } finally {
+            JAWT_FreeDrawingSurface(ds, awt.FreeDrawingSurface());
+        }
+    }
+
+    private static boolean hasSwingRootAncestor(Component component) {
+        for (Container parent = component.getParent(); parent != null; parent = parent.getParent()) {
+            if (parent instanceof JRootPane) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isAppKitMainThread() {
+        return invokePPI(objc_getClass("NSThread"), sel_getUid("isMainThread"), objc_msgSend) != 0;
+    }
+
+    private void drainReadyPresentationBarriers() {
+        long barrier;
+        while ((barrier = firstPresentationBarrier()) != 0L && tryLockReadyBarrier(barrier)) {
+            invokePPV(barrier, sel_getUid("unlock"), objc_msgSend);
+            releasePresentationBarrier(barrier);
+        }
+    }
+
+    private static boolean tryLockReadyBarrier(long barrier) {
+        return invokePPI(barrier, sel_getUid("tryLockWhenCondition:"), 1, objc_msgSend) != 0;
+    }
+
+    private long firstPresentationBarrier() {
+        synchronized (presentationBarriers) {
+            return presentationBarriers.isEmpty() ? 0L : presentationBarriers.get(0);
+        }
+    }
+
+    private void releasePresentationBarrier(long completedBarrier) {
+        boolean removed = false;
+        synchronized (presentationBarriers) {
+            if (!presentationBarriers.isEmpty()
+                    && presentationBarriers.get(0) == completedBarrier) {
+                presentationBarriers.remove(0);
+                removed = true;
+            }
+        }
+        if (removed) {
+            invokePPV(completedBarrier, sel_getUid("release"), objc_msgSend);
+        }
+    }
+
+    private void releaseAllPresentationBarriers() {
+        List<Long> barriers;
+        synchronized (presentationBarriers) {
+            barriers = new ArrayList<>(presentationBarriers);
+            presentationBarriers.clear();
+        }
+        releasePresentationBarriers(barriers);
+    }
+
+    private static void releasePresentationBarriers(List<Long> barriers) {
+        for (Long barrier : barriers) {
+            invokePPV(barrier, sel_getUid("release"), objc_msgSend);
+        }
+    }
+
     private static long NSOpenGLView_initWithFrame(long nsopenglView, double x, double y, double width, double height, long pixelFormat) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             FFIType cgRect = createCGRectType(stack);
@@ -518,6 +717,7 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
         this.surfaceLayer = 0L;
         this.doubleBuffered = false;
         this.canvas = null;
+        releaseAllPresentationBarriers();
 
         Throwable cleanupFailure = null;
         if (failedContext != 0L && CGLGetCurrentContext() == failedContext) {
@@ -604,6 +804,7 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
         performSelectorOnMainThread(view, sel_getUid("clearGLContext"), MemoryUtil.NULL);
         performSelectorOnMainThread(view, sel_getUid("release"), MemoryUtil.NULL);
         performSelectorOnMainThread(surfaceLayer, sel_getUid("release"), MemoryUtil.NULL);
+        releaseAllPresentationBarriers();
         return true;
     }
 
@@ -620,8 +821,6 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
             try {
                 int width = dsi.bounds().width();
                 int height = dsi.bounds().height();
-                int[] layerBounds = getLayerBounds(canvas, dsi.bounds().x(), dsi.bounds().y(), width, height);
-                updateLayerBounds(layerBounds);
                 FramebufferSizeUtil.getScaledSize(canvas, width, height, currentFramebufferSize);
                 int backingWidth = currentFramebufferSize[0];
                 int backingHeight = currentFramebufferSize[1];
@@ -644,10 +843,10 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
         return true;
     }
 
-    private void updateLayerBounds(int[] bounds) {
+    private boolean updateLayerBounds(int[] bounds) {
         if (bounds[0] == layerX && bounds[1] == layerY
                 && bounds[2] == layerWidth && bounds[3] == layerHeight) {
-            return;
+            return false;
         }
         boolean resized = bounds[2] != layerWidth || bounds[3] != layerHeight;
         layerX = bounds[0];
@@ -664,6 +863,7 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
             setFrameOnMainThread(invokePPP(view, sel_getUid("layer"), objc_msgSend),
                     0, 0, layerWidth, layerHeight);
         }
+        return true;
     }
 
     static int[] getLayerBounds(Canvas canvas, int x, int y, int width, int height) {
@@ -740,6 +940,7 @@ public class PlatformMacOSXGLCanvas implements PlatformGLCanvas {
 
     @Override
     public void dispose() {
+        releaseAllPresentationBarriers();
         canvas = null;
     }
 

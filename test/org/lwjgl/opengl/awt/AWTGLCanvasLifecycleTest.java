@@ -10,6 +10,9 @@ import java.awt.Rectangle;
 import java.awt.Transparency;
 import java.awt.geom.AffineTransform;
 import java.awt.image.ColorModel;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -136,6 +139,65 @@ class AWTGLCanvasLifecycleTest {
 
         assertEquals(Arrays.asList("create", "lock", "makeCurrent:42", "init", "paint",
                 "swapBuffers", "makeCurrent:0", "unlock"), platform.calls);
+    }
+
+    @Test
+    void renderPreparesNativePresentationBeforeLockingDrawingSurface() {
+        RecordingPlatformCanvas platform = new RecordingPlatformCanvas();
+        platform.recordPrepareForRender = true;
+        TestCanvas canvas = new TestCanvas(platform);
+
+        canvas.render();
+
+        assertEquals(Arrays.asList("create", "prepareForRender", "lock", "makeCurrent:42",
+                "makeCurrent:0", "unlock"), platform.calls);
+    }
+
+    @Test
+    void renderWaitsForAWTHierarchyUpdateBeforeNativeWork() throws Exception {
+        RecordingPlatformCanvas platform = new RecordingPlatformCanvas();
+        TestCanvas canvas = new TestCanvas(platform) {
+            @Override
+            public boolean isShowing() {
+                return true;
+            }
+        };
+        CountDownLatch rendererStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> renderFailure = new AtomicReference<>();
+        Thread renderer = new Thread(() -> {
+            rendererStarted.countDown();
+            try {
+                canvas.render();
+            } catch (Throwable failure) {
+                renderFailure.set(failure);
+            }
+        }, "awt-hierarchy-renderer");
+
+        synchronized (canvas.getTreeLock()) {
+            renderer.start();
+            assertTrue(rendererStarted.await(5, TimeUnit.SECONDS));
+            ThreadMXBean threads = ManagementFactory.getThreadMXBean();
+            int treeLockIdentity = System.identityHashCode(canvas.getTreeLock());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!isBlockedOnLock(threads.getThreadInfo(renderer.getId()), treeLockIdentity)
+                    && System.nanoTime() < deadline) {
+                Thread.yield();
+            }
+            assertTrue(isBlockedOnLock(threads.getThreadInfo(renderer.getId()), treeLockIdentity),
+                    "Renderer did not block on the AWT tree lock");
+            assertTrue(platform.calls.isEmpty(), "Native rendering started during an AWT hierarchy update");
+        }
+
+        renderer.join(TimeUnit.SECONDS.toMillis(5));
+        assertFalse(renderer.isAlive());
+        assertNull(renderFailure.get());
+        assertEquals(Arrays.asList("create", "lock", "makeCurrent:42", "makeCurrent:0", "unlock"),
+                platform.calls);
+    }
+
+    private static boolean isBlockedOnLock(ThreadInfo info, int lockIdentity) {
+        return info != null && info.getThreadState() == Thread.State.BLOCKED
+                && info.getLockInfo() != null && info.getLockInfo().getIdentityHashCode() == lockIdentity;
     }
 
     @Test
@@ -438,6 +500,7 @@ class AWTGLCanvasLifecycleTest {
         RuntimeException framebufferSizeFailure;
         long makeCurrentFailureContext = Long.MIN_VALUE;
         long makeCurrentExceptionContext = Long.MIN_VALUE;
+        boolean recordPrepareForRender;
         boolean reportsFramebufferSize = true;
         int framebufferWidth;
         int framebufferHeight;
@@ -446,6 +509,13 @@ class AWTGLCanvasLifecycleTest {
         public long create(Canvas canvas, GLData data, GLData effective) {
             calls.add("create");
             return 42L;
+        }
+
+        @Override
+        public void prepareForRender() {
+            if (recordPrepareForRender) {
+                calls.add("prepareForRender");
+            }
         }
 
         @Override

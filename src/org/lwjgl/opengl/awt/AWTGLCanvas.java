@@ -8,6 +8,7 @@ import java.awt.*;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.awt.event.ComponentListener;
+import java.awt.event.HierarchyEvent;
 import java.util.concurrent.Callable;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -42,6 +43,7 @@ public abstract class AWTGLCanvas extends Canvas {
     protected final GLData effective = new GLData();
     protected boolean initCalled;
     private final ReentrantLock lifecycleLock = new ReentrantLock();
+    private volatile boolean preparedShowingState;
     private volatile int framebufferWidth;
     private volatile int framebufferHeight;
     private final ComponentListener listener = new ComponentAdapter() {
@@ -98,6 +100,11 @@ public abstract class AWTGLCanvas extends Canvas {
     protected AWTGLCanvas(GLData data) {
         this.data = data;
         this.addComponentListener(listener);
+        this.addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) != 0 && !isShowing()) {
+                preparedShowingState = false;
+            }
+        });
         this.addPropertyChangeListener("graphicsConfiguration", e -> updateFramebufferSizeFromComponent());
     }
 
@@ -112,6 +119,11 @@ public abstract class AWTGLCanvas extends Canvas {
             } catch (AWTException e) {
                 throw new RuntimeException("Exception while creating the OpenGL context", e);
             }
+        }
+        try {
+            platformCanvas.prepareForRender();
+        } catch (AWTException e) {
+            throw new RuntimeException("Native canvas is not ready for rendering", e);
         }
         try {
             platformCanvas.lock(); // <- MUST lock on Linux
@@ -184,6 +196,7 @@ public abstract class AWTGLCanvas extends Canvas {
     }
 
     public <T> T executeInContext(Callable<T> callable) throws Exception {
+        awaitAWTHierarchyUpdate();
         lifecycleLock.lock();
         try {
             beforeRender();
@@ -202,6 +215,7 @@ public abstract class AWTGLCanvas extends Canvas {
     }
 
     public void runInContext(Runnable runnable) {
+        awaitAWTHierarchyUpdate();
         lifecycleLock.lock();
         try {
             beforeRender();
@@ -226,8 +240,13 @@ public abstract class AWTGLCanvas extends Canvas {
      * {@link EventQueue#invokeAndWait(Runnable)}, synchronize on {@link Component#getTreeLock()}, or invoke AWT/Swing
      * operations that acquire the tree lock. Such calls can deadlock with canvas removal on the event-dispatch thread.
      * Post AWT work asynchronously instead.</p>
+     *
+     * <p>After this canvas becomes showing, the next render from a non-AWT thread may block briefly until the window
+     * system has made the native surface presentable, so the first frame is not lost. That wait is bounded: if the
+     * window system does not become ready in time, this method throws a {@link RuntimeException} instead of hanging.</p>
      */
     public void render() {
+        awaitAWTHierarchyUpdate();
         lifecycleLock.lock();
         try {
             beforeRender();
@@ -247,6 +266,21 @@ public abstract class AWTGLCanvas extends Canvas {
         } finally {
             lifecycleLock.unlock();
         }
+    }
+
+    private void awaitAWTHierarchyUpdate() {
+        boolean showing = isShowing();
+        if (lifecycleLock.isHeldByCurrentThread() || showing == preparedShowingState) {
+            return;
+        }
+        // Component.isShowing() intentionally reads the hierarchy without the AWT tree lock. A renderer can therefore
+        // observe a component becoming visible before Component.show() has updated its native peer and dispatched its
+        // hierarchy events. Briefly acquiring the tree lock closes that window. Do this before taking lifecycleLock to
+        // preserve the tree-lock -> lifecycle-lock ordering used by removeNotify().
+        synchronized (getTreeLock()) {
+            // synchronization barrier only
+        }
+        preparedShowingState = isShowing();
     }
 
     private void afterRender(Throwable callbackFailure) {
@@ -302,6 +336,9 @@ public abstract class AWTGLCanvas extends Canvas {
      *
      * <p>Call this only while the context is current, normally from {@link #paintGL()} or a callback passed to
      * {@link #runInContext(Runnable)} or {@link #executeInContext(Callable)}.</p>
+     *
+     * <p>A platform swap that fails is not reported; its status is discarded. Frames are instead protected by
+     * {@link #render()} sequencing the native surface before drawing begins.</p>
      */
     public final void swapBuffers() {
         lifecycleLock.lock();

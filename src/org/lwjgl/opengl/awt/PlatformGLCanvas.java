@@ -10,6 +10,20 @@ import java.awt.Canvas;
  */
 public interface PlatformGLCanvas {
     long create(Canvas canvas, GLData data, GLData effective) throws AWTException;
+
+    /**
+     * Prepares the native surface for rendering after a visibility or bounds change.
+     *
+     * <p>This is called after context creation but before the JAWT drawing surface is locked. Implementations may
+     * finish or sequence pending native work here without deadlocking on that drawing-surface lock.</p>
+     *
+     * <p>On the AWT event-dispatch thread or the platform's UI thread the preparation is best-effort only:
+     * implementations must not wait for pending native work there, because those threads may be the ones that have
+     * to complete it.</p>
+     */
+    default void prepareForRender() throws AWTException {
+    }
+
     boolean deleteContext(long context);
     boolean makeCurrent(long context);
     boolean isCurrent(long context);

@@ -654,6 +654,20 @@ public class PlatformWin32GLCanvas implements PlatformGLCanvas {
     }
 
     @Override
+    public void prepareForRender() {
+        long hwnd = this.hwnd;
+        if (hwnd != 0L) {
+            // Showing a child HWND invalidates it. Drain that native paint (including any background erase) before
+            // OpenGL writes the next front buffer, otherwise the delayed WM_PAINT can overwrite a successful swap.
+            // Only paints pending at this instant are drained; an invalidation arriving after this call can still
+            // repaint over the coming swap, which the next render resolves.
+            // UpdateWindow is deliberately called before lock(), so the AWT toolkit thread cannot contend with a
+            // JAWT drawing-surface lock while processing the paint synchronously.
+            UpdateWindow(hwnd);
+        }
+    }
+
+    @Override
     public boolean makeCurrent(long context) {
         long hdc = requireLockedHdc();
         if (context == 0L)
