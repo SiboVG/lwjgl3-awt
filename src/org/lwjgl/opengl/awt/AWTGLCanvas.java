@@ -469,6 +469,15 @@ public abstract class AWTGLCanvas extends Canvas {
     public final void swapBuffers() {
         lifecycleLock.lock();
         try {
+            if (disposing) {
+                throw new IllegalStateException("Canvas is being disposed");
+            }
+            if (context == 0L) {
+                throw new IllegalStateException("OpenGL context has not been created or was disposed");
+            }
+            if (!platformCanvas.isCurrent(context)) {
+                throw new IllegalStateException("OpenGL context must be current before swapping buffers");
+            }
             platformCanvas.swapBuffers();
         } finally {
             lifecycleLock.unlock();
@@ -483,7 +492,10 @@ public abstract class AWTGLCanvas extends Canvas {
     @Override
     public Graphics getGraphics() {
     	Graphics graphics = super.getGraphics();
-    	return (graphics instanceof Graphics2D) ? 
+    	if (graphics == null) {
+    		return null;
+    	}
+    	return (graphics instanceof Graphics2D) ?
     			new NonClearGraphics2D((Graphics2D) graphics) : new NonClearGraphics(graphics);
     }
 

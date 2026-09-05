@@ -36,6 +36,7 @@ import org.lwjgl.system.CallbackI;
 import org.lwjgl.system.Checks;
 import org.lwjgl.system.JNI;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.system.jawt.JAWT;
 import org.lwjgl.system.jawt.JAWTDrawingSurface;
 import org.lwjgl.system.jawt.JAWTDrawingSurfaceInfo;
@@ -60,7 +61,7 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 			CONTEXT_CREATION_ERROR_HANDLER.address();
 	public static final JAWT awt;
 	static {
-		awt = JAWT.calloc();
+		awt = JAWT.create(MemoryUtil.getAllocator().calloc(1, JAWT.SIZEOF)); // untracked allocation
 		awt.version(JAWT_VERSION_1_4);
 		if (!JAWT_GetAWT(awt))
 			throw new AssertionError("GetAWT failed");
@@ -70,11 +71,9 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 	public long drawable;
 	public JAWTDrawingSurface ds;
 	private Canvas canvas;
+	private Thread drawingSurfaceThread;
 
 	private long create(int depth, GLData attribs, GLData effective) throws AWTException {
-		if (attribs.versionPolicy != GLData.VersionPolicy.EXACT) {
-			GLUtil.validateVersionAttributes(attribs);
-		}
 		int screen = X11.XDefaultScreen(display);
 		Set<String> extensions = GLXSwapInterval.parseExtensions(
 				glXQueryExtensionsString(display, screen));
@@ -93,9 +92,17 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 		attrib_list.put(0);
 		attrib_list.flip();
 		PointerBuffer fbConfigs = glXChooseFBConfig(display, screen, attrib_list);
-		if (fbConfigs == null || fbConfigs.capacity() == 0) {
-			// No framebuffer configurations supported!
-			throw new AWTException("No supported framebuffer configurations found");
+		long fbConfig;
+		try {
+			if (fbConfigs == null || fbConfigs.capacity() == 0) {
+				// No framebuffer configurations supported!
+				throw new AWTException("No supported framebuffer configurations found");
+			}
+			fbConfig = fbConfigs.get(0);
+		} finally {
+			if (fbConfigs != null) {
+				X11.XFree(fbConfigs);
+			}
 		}
 
 		GLXSwapInterval swapInterval = verifyGLXCapabilities(extensions, attribs);
@@ -114,7 +121,7 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 		
 		long context = 0L;
 		for (GLUtil.ContextVersion version : candidates) {
-			context = tryCreateContext(fbConfigs.get(0), share_context,
+			context = tryCreateContext(fbConfig, share_context,
 					bufferGLAttribs(attribs, version));
 			if (context != 0L) {
 				break;
@@ -130,9 +137,9 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 
 		boolean initialized = false;
 		try {
-			populateEffectiveGLXAttribs(display, fbConfigs.get(0), effective);
+			populateEffectiveGLXAttribs(display, fbConfig, effective);
 
-			if (!makeCurrent(context)) {
+			if (!glXMakeCurrent(display, drawable, context)) {
 				throw new AWTException("Unable to make context current");
 			}
 			// Mesa resolves an implicit GLX drawable while binding it, so configure the
@@ -141,11 +148,11 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 				swapInterval.apply(display, drawable);
 			}
 			effective.versionPolicy = attribs.versionPolicy;
-			populateEffectiveGLAttribs(effective);
+			populateEffectiveGLAttribs(attribs, effective);
 			initialized = true;
 			return context;
 		} finally {
-			makeCurrent(0 /* no context */);
+			glXMakeCurrent(display, 0L, 0L);
 			if (!initialized) {
 				glXDestroyContext(display, context);
 			}
@@ -178,6 +185,12 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 	}
 
 	public void lock() throws AWTException {
+		if (ds != null) {
+			throw new AWTException("JAWT drawing surface is already locked");
+		}
+		if (canvas == null) {
+			throw new AWTException("Canvas has not been created or was disposed");
+		}
 		JAWTDrawingSurface ds = JAWT_GetDrawingSurface(canvas, awt.GetDrawingSurface());
 		if (ds == null) {
 			throw new AWTException("Failed to get JAWT drawing surface");
@@ -188,6 +201,7 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 			throw new AWTException("JAWT_DrawingSurface_Lock() failed");
 		}
 		this.ds = ds;
+		this.drawingSurfaceThread = Thread.currentThread();
 	}
 
 	public void unlock() throws AWTException {
@@ -195,23 +209,34 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 		if (ds == null) {
 			throw new AWTException("JAWT drawing surface is not locked");
 		}
+		if (drawingSurfaceThread != Thread.currentThread()) {
+			throw new AWTException("JAWT drawing surface must be unlocked by the thread that locked it");
+		}
+		this.ds = null;
+		this.drawingSurfaceThread = null;
 		try {
 			JAWT_DrawingSurface_Unlock(ds, ds.Unlock());
 		} finally {
 			JAWT_FreeDrawingSurface(ds, awt.FreeDrawingSurface());
-			this.ds = null;
 		}
 	}
 
 	public long create(Canvas canvas, GLData attribs, GLData effective) throws AWTException {
+		GLUtil.validateAttributes(attribs);
 		this.canvas = canvas;
 		JAWTDrawingSurface ds = JAWT_GetDrawingSurface(canvas, awt.GetDrawingSurface());
+		if (ds == null) {
+			throw new AWTException("Failed to get JAWT drawing surface");
+		}
 		try {
 			int lock = JAWT_DrawingSurface_Lock(ds, ds.Lock());
 			if ((lock & JAWT_LOCK_ERROR) != 0)
 				throw new AWTException("JAWT_DrawingSurface_Lock() failed");
 			try {
 				JAWTDrawingSurfaceInfo dsi = JAWT_DrawingSurface_GetDrawingSurfaceInfo(ds, ds.GetDrawingSurfaceInfo());
+				if (dsi == null) {
+					throw new AWTException("Failed to get JAWT drawing surface information");
+				}
 				try {
 					JAWTX11DrawingSurfaceInfo dsiWin = JAWTX11DrawingSurfaceInfo.create(dsi.platformInfo());
 					int depth = dsiWin.depth();
@@ -235,9 +260,19 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 	}
 
 	public boolean makeCurrent(long context) {
+		requireLockedDrawingSurface();
 		if (context == 0L)
 			return glXMakeCurrent(display, 0L, 0L);
 		return glXMakeCurrent(display, drawable, context);
+	}
+
+	private void requireLockedDrawingSurface() {
+		if (ds == null) {
+			throw new IllegalStateException("The JAWT drawing surface must be locked for this operation");
+		}
+		if (drawingSurfaceThread != Thread.currentThread()) {
+			throw new IllegalStateException("JAWT drawing surface is locked by another thread");
+		}
 	}
 
 	public boolean isCurrent(long context) {
@@ -433,37 +468,27 @@ public class PlatformLinuxGLCanvas implements PlatformGLCanvas {
 		effective.doubleBuffer = buffer.get(0) == 1;
 	}
 
-	private static void populateEffectiveGLAttribs(GLData effective) throws AWTException {
+	private static void populateEffectiveGLAttribs(GLData requested, GLData effective) throws AWTException {
 		long glGetIntegerv = GL.getFunctionProvider().getFunctionAddress("glGetIntegerv");
 		long glGetString = GL.getFunctionProvider().getFunctionAddress("glGetString");
 		APIVersion version = APIUtil.apiParseVersion(getString(GL11.GL_VERSION, glGetString));
 
+		effective.api = requested.api;
 		effective.majorVersion = version.major;
 		effective.minorVersion = version.minor;
 
-		int profileFlags = getInteger(GL32.GL_CONTEXT_PROFILE_MASK, glGetIntegerv);
-
-		if ((profileFlags & GLX_CONTEXT_ES_PROFILE_BIT_EXT) != 0) {
-			effective.api = GLData.API.GLES;
-		} else {
-			effective.api = GLData.API.GL;
+		if (requested.api == GLData.API.GL && GLUtil.atLeast32(version.major, version.minor)) {
+			int profileFlags = getInteger(GL32.GL_CONTEXT_PROFILE_MASK, glGetIntegerv);
+			if ((profileFlags & GL32.GL_CONTEXT_CORE_PROFILE_BIT) != 0) {
+				effective.profile = GLData.Profile.CORE;
+			} else if ((profileFlags & GL32.GL_CONTEXT_COMPATIBILITY_PROFILE_BIT) != 0) {
+				effective.profile = GLData.Profile.COMPATIBILITY;
+			} else if (profileFlags != 0) {
+				throw new AWTException("Unknown profile " + profileFlags);
+			}
 		}
 
 		if (version.major >= 3) {
-			if (version.major >= 4 || version.minor >= 2) {
-				if ((profileFlags & GL32.GL_CONTEXT_CORE_PROFILE_BIT) != 0) {
-					effective.profile = GLData.Profile.CORE;
-				} else if ((profileFlags & GL32.GL_CONTEXT_COMPATIBILITY_PROFILE_BIT) != 0) {
-					effective.profile = GLData.Profile.COMPATIBILITY;
-				} else if (
-						(profileFlags & GLX_CONTEXT_ES_PROFILE_BIT_EXT) != 0) {
-					// OpenGL ES allows checking for profiles at versions below 3.2, so avoid branching into
-					// the if and actually check later.
-				} else if (profileFlags != 0) {
-					throw new AWTException("Unknown profile " + profileFlags);
-				}
-			}
-
 			int effectiveContextFlags = getInteger(GL30.GL_CONTEXT_FLAGS, glGetIntegerv);
 			effective.debug = (effectiveContextFlags & GL43.GL_CONTEXT_FLAG_DEBUG_BIT) != 0;
 			effective.forwardCompatible =

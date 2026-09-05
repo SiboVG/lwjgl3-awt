@@ -16,6 +16,7 @@ import org.lwjgl.system.APIUtil.APIVersion;
 import org.lwjgl.system.Checks;
 import org.lwjgl.system.JNI;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.system.jawt.JAWT;
 import org.lwjgl.system.jawt.JAWTDrawingSurface;
 import org.lwjgl.system.jawt.JAWTDrawingSurfaceInfo;
@@ -55,13 +56,14 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
 
     private Canvas canvas;
     private JAWTDrawingSurface ds;
+    private Thread drawingSurfaceThread;
     private DisplayRef displayRef;
     private long eglDisplay;
     private long eglSurface;
     private long eglContext;
 
     private static JAWT createAWT() {
-        JAWT awt = JAWT.calloc();
+        JAWT awt = JAWT.create(MemoryUtil.getAllocator().calloc(1, JAWT.SIZEOF)); // untracked allocation
         awt.version(JAWT_VERSION_1_4);
         if (!JAWT_GetAWT(awt)) {
             throw new AssertionError("GetAWT failed");
@@ -476,6 +478,12 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
 
     @Override
     public void lock() throws AWTException {
+        if (ds != null) {
+            throw new AWTException("JAWT drawing surface is already locked");
+        }
+        if (canvas == null) {
+            throw new AWTException("Canvas has not been created or was disposed");
+        }
         JAWTDrawingSurface drawingSurface = JAWT_GetDrawingSurface(canvas, AWT.GetDrawingSurface());
         if (drawingSurface == null) {
             throw new AWTException("Failed to get JAWT drawing surface");
@@ -486,6 +494,7 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
             throw new AWTException("JAWT_DrawingSurface_Lock() failed");
         }
         ds = drawingSurface;
+        drawingSurfaceThread = Thread.currentThread();
     }
 
     @Override
@@ -494,16 +503,21 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
         if (drawingSurface == null) {
             throw new AWTException("JAWT drawing surface is not locked");
         }
+        if (drawingSurfaceThread != Thread.currentThread()) {
+            throw new AWTException("JAWT drawing surface must be unlocked by the thread that locked it");
+        }
+        ds = null;
+        drawingSurfaceThread = null;
         try {
             JAWT_DrawingSurface_Unlock(drawingSurface, drawingSurface.Unlock());
         } finally {
             JAWT_FreeDrawingSurface(drawingSurface, AWT.FreeDrawingSurface());
-            ds = null;
         }
     }
 
     @Override
     public boolean makeCurrent(long context) {
+        requireLockedDrawingSurface();
         if (eglDisplay == EGL_NO_DISPLAY) {
             return context == EGL_NO_CONTEXT;
         }
@@ -511,6 +525,15 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
             return eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         }
         return eglMakeCurrent(eglDisplay, eglSurface, eglSurface, context);
+    }
+
+    private void requireLockedDrawingSurface() {
+        if (ds == null) {
+            throw new IllegalStateException("The JAWT drawing surface must be locked for this operation");
+        }
+        if (drawingSurfaceThread != Thread.currentThread()) {
+            throw new IllegalStateException("JAWT drawing surface is locked by another thread");
+        }
     }
 
     @Override
@@ -621,9 +644,6 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
             DisplayRef created = new DisplayRef(eglDisplay, capabilities);
             DISPLAY_REFS.put(eglDisplay, created);
             return created;
-        } catch (AWTException | RuntimeException | Error failure) {
-            eglTerminate(eglDisplay);
-            throw failure;
         }
     }
 
@@ -649,7 +669,9 @@ public class PlatformLinuxEGLCanvas implements PlatformGLCanvas {
     private static synchronized void releaseDisplay(DisplayRef ref) {
         if (--ref.references == 0) {
             DISPLAY_REFS.remove(ref.eglDisplay);
-            eglTerminate(ref.eglDisplay);
+            // EGLDisplay initialization is process-wide rather than reference-counted. Calling eglTerminate here
+            // would invalidate contexts and surfaces owned by another toolkit that uses the same native display.
+            // Leave termination to process teardown; removing our Java-side entry still releases its capabilities.
         }
     }
 
